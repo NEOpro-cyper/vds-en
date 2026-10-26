@@ -50,12 +50,12 @@ const BROWSER_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36";
 
 const PROFILES = {
-  movy: {
+  by: {
     label: "movy.sx streams (replaces the movy Cloudflare worker)",
     site: "https://movy.sx/",
     origin: "https://movy.sx",
   },
-  moviesapi: {
+  api: {
     label: "moviesapi.to streams (replaces the moviesapi Cloudflare worker)",
     site: "https://moviesapi.to/",
     origin: "https://moviesapi.to",
