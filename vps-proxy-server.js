@@ -264,8 +264,14 @@ let fetchImpl;
 let dispatcher = null; // undici Agent / ProxyAgent (when undici present)
 
 if (undici) {
-  // ---------- undici path: HTTP/2 + aggressive pooling ----------
+  // ---------- undici path: keep-alive pool ----------
+  // Only well-documented Agent options are used here. Earlier versions passed
+  // invalid options (maxCachedMessages, connect.keepAlive, connect.lookup on a
+  // pooled Agent) that caused undici to reject every request synchronously,
+  // surfacing as instant 502s. HTTP/2 is OFF by default for max compatibility
+  // with quirky upstream CDNs (set ALLOW_H2=1 to re-enable).
   const { Agent, ProxyAgent, setGlobalDispatcher } = undici;
+  const allowH2 = process.env.ALLOW_H2 === "1";
   if (process.env.PROXY_URL) {
     console.log(`[vps-proxy-pool] upstream via proxy ${process.env.PROXY_URL}`);
     dispatcher = new ProxyAgent({
@@ -275,26 +281,16 @@ if (undici) {
       connections: UPSTREAM_CONNS,
       bodyTimeout: 0,
       headersTimeout: 30_000,
-      connect: { timeout: 10_000, lookup: cachedLookup },
-      allowH2: true,
+      allowH2,
     });
   } else {
     dispatcher = new Agent({
       keepAliveTimeout: 60_000,
       keepAliveMaxTimeout: 600_000,
-      keepAliveH1Timeout: 30_000,
-      pipelining: 1,
       connections: UPSTREAM_CONNS,
-      maxCachedMessages: 100,
       bodyTimeout: 0,
       headersTimeout: 30_000,
-      allowH2: true,
-      connect: {
-        timeout: 10_000,
-        keepAlive: true,
-        keepAliveInitialDelay: 30_000,
-        lookup: cachedLookup,
-      },
+      allowH2,
     });
   }
   setGlobalDispatcher(dispatcher);
@@ -479,10 +475,17 @@ async function proxyRequest(req, res, targetUrl, encrypt, selfBase, profileName)
       body: req.method !== "GET" && req.method !== "HEAD" ? body : undefined,
       redirect: "follow",
       signal: ac.signal,
-      dispatcher, // ignored by the zero-dep transport
+      // For undici we rely on the GLOBAL dispatcher set via setGlobalDispatcher();
+      // passing `dispatcher` per-request is unreliable across undici versions.
+      // For the zero-dep transport this option is simply ignored.
     });
   } catch (error) {
     if (ac.signal.aborted) return;
+    // Surface the real cause so it's visible in the server logs — the player
+    // never sees the response body, only the 502 status.
+    console.error(
+      `[vps-proxy-pool:${process.pid}] 502 ${req.method} ${targetUrl.host}${targetUrl.pathname} -> ${error.name}: ${error.message}`,
+    );
     return plain(res, 502, "Error: " + error.message);
   }
 
