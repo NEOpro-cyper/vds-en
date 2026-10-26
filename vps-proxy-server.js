@@ -50,17 +50,42 @@ const BROWSER_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36";
 
 const PROFILES = {
-  by: {
-    label: "movy.sx streams (replaces the movy Cloudflare worker)",
-    site: "https://movy.sx/",
-    origin: "https://movy.sx",
+  va: {
+    label: "vidfast streams (replaces the movy Cloudflare worker)",
+    site: "https://vidfast.vc/",
+    origin: "https://vidfast.vc",
   },
-  api: {
+  nass: {
+    label: "xpass streams (replaces the movy Cloudflare worker)",
+    site: "https://play.xpass.top/",
+    origin: "https://play.xpass.top",
+  },
+  nest: {
+    label: "vidnest streams (replaces the movy Cloudflare worker)",
+    site: "https://vidnest.fun/",
+    origin: "https://vidnest.fun",
+  },
+  ck: {
+    label: "vidrock streams (replaces the movy Cloudflare worker)",
+    site: "https://vidrock.to/",
+    origin: "https://vidrock.to",
+  },
+  pi: {
     label: "moviesapi.to streams (replaces the moviesapi Cloudflare worker)",
     site: "https://moviesapi.to/",
     origin: "https://moviesapi.to",
   },
-  none: {
+   vy: {
+    label: "cinejoy streams (replaces the movy Cloudflare worker)",
+    site: "https://movy.sx/",
+    origin: "https://movy.sx",
+  },
+  cdn1: {
+    label: "cinejoy streams (replaces the movy Cloudflare worker)",
+    site: "https://cinejoy.pk/",
+    origin: "https://cinejoy.pk",
+  },
+  hls: {
     label: "generic — no site headers (public CDNs)",
     site: null,
     origin: null,
