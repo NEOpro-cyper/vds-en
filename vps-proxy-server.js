@@ -234,6 +234,12 @@ function rewritePlaylistPlain(text, selfBase, baseUrl) {
 /* DNS cache (used by both transports)                                  */
 /* ------------------------------------------------------------------ */
 
+// DNS cache. CRITICAL: dns.lookup's callback signature is:
+//   - default mode:        callback(err, address, family)    -- string + number
+//   - all: true mode:      callback(err, addresses)          -- array of {address, family}
+// We MUST replay the EXACT same signature on a cache hit, otherwise net.connect
+// throws "RangeError: Invalid address family: undefined" (which is what was
+// producing the flood of 502s at 1-8ms latency on every request).
 const dnsCache = new Map();
 function makeCachedLookup() {
   return function cachedLookup(hostname, options, callback) {
@@ -241,16 +247,26 @@ function makeCachedLookup() {
       callback = options;
       options = {};
     }
-    const key = hostname + ":" + (options.family || 0);
+    const wantAll = options.all === true;
+    const key = hostname + ":" + (options.family || 0) + ":" + (wantAll ? "a" : "s");
     const hit = dnsCache.get(key);
     if (hit && Date.now() - hit.ts < DNS_TTL) {
-      const v = Array.isArray(hit.value) ? hit.value.slice() : hit.value;
-      return process.nextTick(() => callback(null, v));
+      return process.nextTick(() => {
+        if (wantAll) callback(null, hit.addresses);        // array form
+        else callback(null, hit.address, hit.family);      // string + family form
+      });
     }
-    dns.lookup(hostname, options, (err, value) => {
+    dns.lookup(hostname, options, (err, address, family) => {
       if (err) return callback(err);
-      dnsCache.set(key, { value, ts: Date.now() });
-      callback(null, value);
+      if (wantAll) {
+        // address is an array of {address, family} records here
+        dnsCache.set(key, { addresses: address, ts: Date.now() });
+        callback(null, address);
+      } else {
+        // address is a string, family is 4 or 6
+        dnsCache.set(key, { address, family, ts: Date.now() });
+        callback(null, address, family);
+      }
     });
   };
 }
