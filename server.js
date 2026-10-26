@@ -320,7 +320,13 @@ function createServer() {
         return res.end();
       }
 
-      const selfOrigin = `http://${req.headers.host || "localhost"}`;
+      // Behind Coolify/Traefik/nginx the public scheme is HTTPS while the
+      // app itself sees HTTP — trust the forwarded proto so rewritten
+      // playlist URLs keep the correct scheme (no mixed-content breaks).
+      const fwdHost = req.headers["x-forwarded-host"];
+      const host = (typeof fwdHost === "string" && fwdHost ? fwdHost : req.headers.host) || "localhost";
+      const fwdProto = String(req.headers["x-forwarded-proto"] || "http").split(",")[0].trim();
+      const selfOrigin = `${fwdProto}://${host}`;
 
       // health / docs
       let path = req.url;
