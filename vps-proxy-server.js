@@ -423,7 +423,7 @@ function createServer() {
 
       await proxyRequest(req, res, targetUrl, profile, false, selfBase);
       log(req, res, profileName, "plain", started);
-    } catch (err) {
+        } catch (err) {
       if (!res.headersSent) {
         plain(res, 500, "Error: " + (err && err.message ? err.message : String(err)));
       } else {
@@ -431,6 +431,13 @@ function createServer() {
       }
     }
   });
+  // abrupt socket resets — close the socket, never crash
+  server.on("clientError", (err, socket) => {
+    try {
+      if (socket.writable) socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
+    } catch (e) {}
+  });
+  return server;
 }
 
 function log(req, res, profile, mode, started) {
