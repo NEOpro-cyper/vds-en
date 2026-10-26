@@ -1,85 +1,51 @@
 /**
- * VPS multi-worker proxy pool — OPTIMIZED for high-throughput segment serving.
+ * VPS multi-worker proxy pool — OPTIMIZED, ZERO-DEPENDENCY (Node >= 18).
  *
- *   npm i undici          <-- REQUIRED now (connection pooling + HTTP/2)
- *   node vps-proxy-server.js
+ *   node vps-proxy-server.js            (PORT=8080 HOST=0.0.0.0)
  *
- *   PORT=8080 HOST=0.0.0.0 WORKERS=10 node vps-proxy-server.js
+ *   npm i undici   is OPTIONAL — if present, adds HTTP/2 + undici pooling.
+ *   Without it the server still runs fast using built-in keep-alive agents.
  *
  * ---------------------------------------------------------------------------
  * OPTIMIZATIONS vs. original
  * ---------------------------------------------------------------------------
- *   1. CLUSTER MODE      spawns N workers (default = os.cpus().length).
- *                        Your 10-core VPS now uses ALL 10 cores, not just 1.
- *                        Workers auto-restart on crash.
- *
- *   2. CONNECTION POOL   undici Agent with aggressive keep-alive + HTTP/2.
- *                        Reuses TCP+TLS connections to the same upstream,
- *                        eliminating the handshake cost that was dominating
- *                        per-segment latency.
- *
- *   3. HTTP/2            MultiPLEXED streams on a single connection to
- *                        HTTP/2-capable upstreams — many segments in flight
- *                        over ONE connection.
- *
- *   4. DNS CACHE         Custom lookup function caches A/AAAA records for
- *                        60s, removing per-request DNS latency.
- *
- *   5. TOKEN CACHE        LRU cache (10k entries) for encryptToken(). Same
- *                        URL always produces the same token, so encrypting
- *                        the same child URL 1000x in a playlist now costs
- *                        nothing after the first call.
- *
- *   6. SERVER TUNING      keepAliveTimeout 120s, headersTimeout 125s,
- *                        maxConnections 16k — keeps client sockets warm and
- *                        accepts far more concurrent players.
- *
- *   7. PRE-COMPUTED CORS  CORS_HEADERS frozen once, reused via spread.
- *
- *   8. STREAM BACKPRESSURE Upstream pipe uses explicit .pipe(res) with
- *                        error handlers — no unnecessary buffering.
- *
- *   9. SHARED SECRET       Same shared TOKEN_SECRET — APIs keep working
- *                        unchanged. Tokens produced by this server are
- *                        byte-compatible with the old Cloudflare workers.
+ *   1. CLUSTER MODE        N workers (default = os.cpus().length) — uses all
+ *                          10 cores instead of 1. Workers auto-respawn.
+ *   2. CONNECTION POOLING  keep-alive agents (built-in http/https.Agent, or
+ *                          undici Agent when installed). TCP+TLS connections
+ *                          to the same upstream are REUSED — no handshake
+ *                          cost per segment. This was the biggest slowdown.
+ *   3. HTTP/2              (undici only) multiplexes segments over one conn.
+ *   4. DNS CACHE           60s TTL lookup cache — no per-request DNS latency.
+ *   5. TOKEN CACHE         LRU for encryptToken() — deterministic tokens are
+ *                          computed once per URL, not per request.
+ *   6. SERVER TUNING       keepAliveTimeout 120s, maxConnections 16384,
+ *                          timeout 0 — warm client sockets, no stream cuts.
+ *   7. PRE-BUILT HEADERS   per-profile browser headers built once.
  *
  * Env:
  *   PORT             listen port (default 8080)
  *   HOST             bind address (default 0.0.0.0)
- *   TOKEN_SECRET     AES-256-GCM secret (default = shared secret of all APIs)
- *   DEFAULT_PROFILE  profile used for root-level /https://... and /v1... paths
- *   PROXY_URL        optional outbound proxy (uses undici ProxyAgent)
+ *   TOKEN_SECRET     AES-256-GCM secret
+ *   DEFAULT_PROFILE  profile for root-level /https://... and /v1... paths
+ *   PROXY_URL        optional outbound proxy (REQUIRES: npm i undici)
  *   WORKERS          cluster worker count (default = os.cpus().length)
  *   NO_CLUSTER=1     force single-process mode (debugging)
- *   UPSTREAM_CONNS   max connections per upstream origin (default 256)
- *   CACHE_DNS_TTL    DNS cache TTL in ms (default 60000)
+ *   UPSTREAM_CONNS   max sockets per upstream origin per worker (default 256)
+ *   CACHE_DNS_TTL    DNS cache TTL ms (default 60000)
  */
 
 const http = require("node:http");
+const https = require("node:https");
 const cluster = require("node:cluster");
 const os = require("node:os");
 const dns = require("node:dns");
 const { Readable } = require("node:stream");
 const { webcrypto } = require("node:crypto");
 
-// undici is now required (connection pooling is the #1 perf win).
-// `npm i undici`. Node 18+ ships undici internally but does NOT expose it
-// via require(), so the npm package must be installed.
-let undici;
-try {
-  undici = require("undici");
-} catch (e) {
-  console.error(
-    "[vps-proxy-pool] undici is now REQUIRED for connection pooling.\n" +
-      "Run: npm i undici\n" +
-      "Then restart the server.",
-  );
-  process.exit(1);
-}
-const { Agent, ProxyAgent, setGlobalDispatcher } = undici;
-// Use undici's own fetch so we can pass the dispatcher explicitly. Falls back
-// to global fetch (which uses the same global dispatcher set below) anyway.
-const fetchImpl = undici.fetch || global.fetch;
+// undici is OPTIONAL now. Built-in keep-alive agents are the fallback.
+let undici = null;
+try { undici = require("undici"); } catch (e) { /* zero-dep mode */ }
 
 const PORT = Number(process.env.PORT) || 8080;
 const HOST = process.env.HOST || "0.0.0.0";
@@ -92,26 +58,33 @@ const USE_CLUSTER = process.env.NO_CLUSTER !== "1" && WORKERS > 1;
 const UPSTREAM_CONNS = Number(process.env.UPSTREAM_CONNS) || 256;
 const DNS_TTL = Number(process.env.CACHE_DNS_TTL) || 60_000;
 
+if (process.env.PROXY_URL && !undici) {
+  console.error(
+    "[vps-proxy-pool] PROXY_URL is set but undici is not installed — run: npm i undici",
+  );
+  process.exit(1);
+}
+
 /* ------------------------------------------------------------------ */
-/* Worker profiles — unchanged from original.                          */
+/* Worker profiles                                                      */
 /* ------------------------------------------------------------------ */
 
 const BROWSER_UA =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36";
 
 const PROFILES = {
-  va:   { label: "vidfast streams",                       site: "https://vidfast.vc/",   origin: "https://vidfast.vc"   },
+  va:   { label: "vidfast streams",                        site: "https://vidfast.vc/",     origin: "https://vidfast.vc"   },
   nass: { label: "xpass streams",                          site: "https://play.xpass.top/", origin: "https://play.xpass.top" },
-  nest: { label: "vidnest streams",                        site: "https://vidnest.fun/",  origin: "https://vidnest.fun"  },
-  ck:   { label: "vidrock streams",                        site: "https://vidrock.to/",   origin: "https://vidrock.to"   },
-  pi:   { label: "moviesapi.to streams",                    site: "https://moviesapi.to/",  origin: "https://moviesapi.to"  },
-  vy:   { label: "cinejoy streams (movy.sx)",              site: "https://movy.sx/",       origin: "https://movy.sx"       },
-  cdn1: { label: "cinejoy streams (cinejoy.pk)",           site: "https://cinejoy.pk/",    origin: "https://cinejoy.pk"    },
-  hls:  { label: "generic — no site headers (public CDNs)", site: null,                    origin: null                    },
+  nest: { label: "vidnest streams",                        site: "https://vidnest.fun/",    origin: "https://vidnest.fun"  },
+  ck:   { label: "vidrock streams",                        site: "https://vidrock.to/",     origin: "https://vidrock.to"   },
+  pi:   { label: "moviesapi.to streams",                   site: "https://moviesapi.to/",   origin: "https://moviesapi.to" },
+  vy:   { label: "cinejoy streams (movy.sx)",              site: "https://movy.sx/",        origin: "https://movy.sx"      },
+  cdn1: { label: "cinejoy streams (cinejoy.pk)",           site: "https://cinejoy.pk/",     origin: "https://cinejoy.pk"   },
+  hls:  { label: "generic — no site headers (public CDNs)", site: null,                     origin: null                   },
 };
 
 /* ------------------------------------------------------------------ */
-/* LRU cache — tiny Map-based, used for encryptToken + playlist URLs   */
+/* LRU cache                                                            */
 /* ------------------------------------------------------------------ */
 
 class LRU {
@@ -122,7 +95,6 @@ class LRU {
   get(key) {
     if (!this.map.has(key)) return undefined;
     const v = this.map.get(key);
-    // move to end (most-recently-used)
     this.map.delete(key);
     this.map.set(key, v);
     return v;
@@ -140,9 +112,7 @@ class LRU {
 const tokenCache = new LRU(10_000);
 
 /* ------------------------------------------------------------------ */
-/* AES-256-GCM token helpers — same wire format, cached results        */
-/* Token: v1.<b64url(iv)>.<b64url(ciphertext+authtag)>                  */
-/* Deterministic IV = SHA-256("iv:" + url)[0..12] — same URL = same token */
+/* AES-256-GCM token helpers (cached)                                   */
 /* ------------------------------------------------------------------ */
 
 const TOKEN_RE = /^v1\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/;
@@ -196,18 +166,18 @@ async function encryptToken(rawUrl) {
 }
 
 async function replaceAsync(str, regex, asyncFn) {
-  const matches = [];
+  const jobs = [];
   str.replace(regex, (match, ...args) => {
-    matches.push(asyncFn(match, ...args));
+    jobs.push(asyncFn(match, ...args));
     return match;
   });
-  const values = await Promise.all(matches);
+  const values = await Promise.all(jobs);
   let i = 0;
   return str.replace(regex, () => values[i++]);
 }
 
 /* ------------------------------------------------------------------ */
-/* Playlist rewriters — unchanged behavior, just hit the token cache   */
+/* Playlist rewriters (unchanged behavior)                              */
 /* ------------------------------------------------------------------ */
 
 async function rewritePlaylistEncrypted(text, selfBase, baseUrl) {
@@ -261,22 +231,21 @@ function rewritePlaylistPlain(text, selfBase, baseUrl) {
 }
 
 /* ------------------------------------------------------------------ */
-/* DNS caching — cuts ~10-50ms per request on cold upstreams           */
+/* DNS cache (used by both transports)                                  */
 /* ------------------------------------------------------------------ */
 
 const dnsCache = new Map();
 function makeCachedLookup() {
-  return (hostname, options, callback) => {
+  return function cachedLookup(hostname, options, callback) {
     if (typeof options === "function") {
       callback = options;
       options = {};
     }
     const key = hostname + ":" + (options.family || 0);
-    const cached = dnsCache.get(key);
-    if (cached && Date.now() - cached.ts < DNS_TTL) {
-      // clone to avoid caller mutating the cached value
-      const v = Array.isArray(cached.value) ? cached.value.slice() : cached.value;
-      return callback(null, v);
+    const hit = dnsCache.get(key);
+    if (hit && Date.now() - hit.ts < DNS_TTL) {
+      const v = Array.isArray(hit.value) ? hit.value.slice() : hit.value;
+      return process.nextTick(() => callback(null, v));
     }
     dns.lookup(hostname, options, (err, value) => {
       if (err) return callback(err);
@@ -285,48 +254,171 @@ function makeCachedLookup() {
     });
   };
 }
+const cachedLookup = makeCachedLookup();
 
 /* ------------------------------------------------------------------ */
-/* Upstream dispatcher — connection pooling + HTTP/2 + (optional) proxy */
+/* TRANSPORT                                                            */
 /* ------------------------------------------------------------------ */
 
-function buildDispatcher() {
+let fetchImpl;
+let dispatcher = null; // undici Agent / ProxyAgent (when undici present)
+
+if (undici) {
+  // ---------- undici path: HTTP/2 + aggressive pooling ----------
+  const { Agent, ProxyAgent, setGlobalDispatcher } = undici;
   if (process.env.PROXY_URL) {
     console.log(`[vps-proxy-pool] upstream via proxy ${process.env.PROXY_URL}`);
-    return new ProxyAgent({
+    dispatcher = new ProxyAgent({
       uri: process.env.PROXY_URL,
-      // keep proxy connections warm too
       keepAliveTimeout: 60_000,
       keepAliveMaxTimeout: 600_000,
       connections: UPSTREAM_CONNS,
       bodyTimeout: 0,
       headersTimeout: 30_000,
-      connect: { timeout: 10_000, lookup: makeCachedLookup() },
+      connect: { timeout: 10_000, lookup: cachedLookup },
       allowH2: true,
     });
+  } else {
+    dispatcher = new Agent({
+      keepAliveTimeout: 60_000,
+      keepAliveMaxTimeout: 600_000,
+      keepAliveH1Timeout: 30_000,
+      pipelining: 1,
+      connections: UPSTREAM_CONNS,
+      maxCachedMessages: 100,
+      bodyTimeout: 0,
+      headersTimeout: 30_000,
+      allowH2: true,
+      connect: {
+        timeout: 10_000,
+        keepAlive: true,
+        keepAliveInitialDelay: 30_000,
+        lookup: cachedLookup,
+      },
+    });
   }
-  return new Agent({
-    // ----- aggressive keep-alive: this is the single biggest perf win -----
-    keepAliveTimeout: 60_000,        // idle socket idle for 60s before close
-    keepAliveMaxTimeout: 600_000,    // hard cap 10 min
-    keepAliveH1Timeout: 30_000,
-    pipelining: 1,                    // HTTP/1.1 pipelining off (safer with CDNs)
-    connections: UPSTREAM_CONNS,      // sockets per origin (default 128 -> 256)
-    maxCachedMessages: 100,
-    bodyTimeout: 0,                   // large segments can take a while
-    headersTimeout: 30_000,           // 30s for upstream to send headers
-    allowH2: true,                     // HTTP/2 multiplexing where supported
-    connect: {
-      timeout: 10_000,
-      keepAlive: true,
-      keepAliveInitialDelay: 30_000,
-      lookup: makeCachedLookup(),
-    },
-  });
-}
+  setGlobalDispatcher(dispatcher);
+  fetchImpl = undici.fetch;
+} else {
+  // ---------- zero-dep path: node:http/https with keep-alive agents ----------
+  const agentCommon = {
+    keepAlive: true,
+    keepAliveMsecs: 30_000,
+    maxSockets: UPSTREAM_CONNS,
+    maxFreeSockets: 64,
+    scheduling: "lifo",
+    noDelay: true,
+  };
+  const keepAliveHttp = new http.Agent(agentCommon);
+  const keepAliveHttps = new https.Agent(agentCommon);
 
-const dispatcher = buildDispatcher();
-setGlobalDispatcher(dispatcher);
+  const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
+
+  function wrapIncoming(response, signal) {
+    // kill upstream when client aborts
+    if (signal) {
+      const onAbort = () => { try { response.destroy(); } catch (e) {} };
+      if (signal.aborted) onAbort();
+      else signal.addEventListener("abort", onAbort, { once: true });
+    }
+    return {
+      status: response.statusCode || 502,
+      headers: {
+        get(name) {
+          const v = response.headers[String(name).toLowerCase()];
+          return v === undefined ? null : Array.isArray(v) ? v.join(", ") : v;
+        },
+        forEach(cb) {
+          for (const [k, v] of Object.entries(response.headers)) {
+            if (Array.isArray(v)) v.forEach((vv) => cb(vv, k));
+            else cb(v, k);
+          }
+        },
+      },
+      text() {
+        return new Promise((resolve, reject) => {
+          const chunks = [];
+          response.on("data", (c) => chunks.push(c));
+          response.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+          response.on("error", reject);
+        });
+      },
+      body: response, // Node stream — proxyRequest handles both kinds
+    };
+  }
+
+  function nodeRequest(urlString, opts, redirectCount = 0) {
+    return new Promise((resolve, reject) => {
+      const url = new URL(urlString);
+      const isHttps = url.protocol === "https:";
+      const mod = isHttps ? https : http;
+      const agent = isHttps ? keepAliveHttps : keepAliveHttp;
+      const { method = "GET", headers = {}, body, signal } = opts;
+
+      let settled = false;
+      const request = mod.request(
+        {
+          protocol: url.protocol,
+          hostname: url.hostname,
+          port: url.port || (isHttps ? 443 : 80),
+          path: url.pathname + url.search,
+          method,
+          headers,
+          agent,
+          lookup: cachedLookup,
+        },
+        (response) => {
+          const status = response.statusCode || 0;
+          const location = response.headers.location;
+          if (redirectCount < 10 && location && REDIRECT_STATUSES.has(status)) {
+            response.resume(); // drain + release socket back to the pool
+            let nextMethod = method;
+            let nextBody = body;
+            if (status === 303 || ((status === 301 || status === 302) && method === "POST")) {
+              nextMethod = "GET";
+              nextBody = undefined;
+            }
+            nodeRequest(new URL(location, url).toString(),
+              { ...opts, method: nextMethod, body: nextBody }, redirectCount + 1)
+              .then(resolve, reject);
+            return;
+          }
+          settled = true;
+          resolve(wrapIncoming(response, signal));
+        },
+      );
+
+      const onAbort = () => { try { request.destroy(); } catch (e) {} };
+      if (signal) {
+        if (signal.aborted) {
+          return reject(new Error("aborted"));
+        }
+        signal.addEventListener("abort", onAbort, { once: true });
+      }
+
+      // headers/connect must arrive within 30s
+      const headerTimer = setTimeout(() => {
+        request.destroy(new Error("upstream timeout (headers)"));
+      }, 30_000);
+      request.on("response", () => clearTimeout(headerTimer));
+
+      // kill fully-stalled sockets after 2 min of silence
+      request.setTimeout(120_000, () => {
+        request.destroy(new Error("upstream socket idle timeout"));
+      });
+
+      request.on("error", (err) => {
+        clearTimeout(headerTimer);
+        reject(err);
+      });
+
+      if (body && method !== "GET" && method !== "HEAD") request.write(body);
+      request.end();
+    });
+  }
+
+  fetchImpl = nodeRequest;
+}
 
 /* ------------------------------------------------------------------ */
 /* Core proxy handler                                                   */
@@ -343,7 +435,7 @@ function plain(res, status, msg) {
   res.end(msg);
 }
 
-// Pre-built per-profile browser headers — built once at startup.
+// per-profile browser headers built once at startup
 const PROFILE_BROWSER_HEADERS = {};
 for (const [name, p] of Object.entries(PROFILES)) {
   const h = {
@@ -364,7 +456,7 @@ for (const [name, p] of Object.entries(PROFILES)) {
   PROFILE_BROWSER_HEADERS[name] = h;
 }
 
-async function proxyRequest(req, res, targetUrl, profile, encrypt, selfBase, profileName) {
+async function proxyRequest(req, res, targetUrl, encrypt, selfBase, profileName) {
   const upHeaders = { ...PROFILE_BROWSER_HEADERS[profileName] };
   if (req.headers.range) upHeaders.Range = req.headers.range;
 
@@ -387,7 +479,7 @@ async function proxyRequest(req, res, targetUrl, profile, encrypt, selfBase, pro
       body: req.method !== "GET" && req.method !== "HEAD" ? body : undefined,
       redirect: "follow",
       signal: ac.signal,
-      dispatcher,
+      dispatcher, // ignored by the zero-dep transport
     });
   } catch (error) {
     if (ac.signal.aborted) return;
@@ -396,7 +488,7 @@ async function proxyRequest(req, res, targetUrl, profile, encrypt, selfBase, pro
 
   const contentType = response.headers.get("Content-Type") || "";
 
-  // ---- HLS playlist: rewrite, then return as text ----
+  // ---- HLS playlist: rewrite, return as text ----
   if (contentType.includes("mpegurl") || targetUrl.pathname.endsWith(".m3u8")) {
     let text = await response.text();
     text = encrypt
@@ -414,10 +506,10 @@ async function proxyRequest(req, res, targetUrl, profile, encrypt, selfBase, pro
     return res.end(bodyBuf);
   }
 
-  // ---- everything else: STREAM through with minimal header work ----
+  // ---- everything else: stream through ----
   const outHeaders = { "X-Proxy-Mode": encrypt ? "encrypted" : "plain" };
   response.headers.forEach((v, k) => {
-    const lk = k.toLowerCase();
+    const lk = String(k).toLowerCase();
     if (
       lk === "content-encoding" ||
       lk === "content-length" ||
@@ -432,11 +524,17 @@ async function proxyRequest(req, res, targetUrl, profile, encrypt, selfBase, pro
   res.writeHead(response.status, { ...outHeaders, ...CORS_HEADERS });
 
   if (!response.body || req.method === "HEAD") return res.end();
-  const stream = Readable.fromWeb(response.body);
-  stream.on("error", () => {
-    try { res.destroy(); } catch (e) {}
-  });
-  stream.pipe(res);
+
+  if (typeof response.body.pipe === "function") {
+    // zero-dep transport: Node IncomingMessage
+    response.body.on("error", () => { try { res.destroy(); } catch (e) {} });
+    response.body.pipe(res);
+  } else {
+    // undici transport: web ReadableStream
+    const stream = Readable.fromWeb(response.body);
+    stream.on("error", () => { try { res.destroy(); } catch (e) {} });
+    stream.pipe(res);
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -465,7 +563,13 @@ function createServer() {
           Object.entries(PROFILES).map(([k, v]) => [k, v.label]),
         );
         const body = JSON.stringify(
-          { ok: true, profiles, defaultProfile: DEFAULT_PROFILE },
+          {
+            ok: true,
+            transport: undici ? "undici (h2 + pool)" : "node keep-alive agents",
+            workers: USE_CLUSTER ? WORKERS : 1,
+            defaultProfile: DEFAULT_PROFILE,
+            profiles,
+          },
           null,
           2,
         );
@@ -495,7 +599,6 @@ function createServer() {
           `Unknown profile "${m[1]}". Available: ${Object.keys(PROFILES).join(", ")}`,
         );
       }
-      const profile = PROFILES[profileName];
       const selfBase = `${selfOrigin}/${profileName}`;
 
       // ---- ENCRYPTED MODE ----
@@ -506,7 +609,7 @@ function createServer() {
         } catch (e) {
           return plain(res, 403, "Invalid or tampered token.");
         }
-        await proxyRequest(req, res, target, profile, true, selfBase, profileName);
+        await proxyRequest(req, res, target, true, selfBase, profileName);
         log(req, res, profileName, "encrypted", started);
         return;
       }
@@ -527,7 +630,7 @@ function createServer() {
         return plain(res, 400, "Invalid target URL provided in path.");
       }
 
-      await proxyRequest(req, res, targetUrl, profile, false, selfBase, profileName);
+      await proxyRequest(req, res, targetUrl, false, selfBase, profileName);
       log(req, res, profileName, "plain", started);
     } catch (err) {
       if (!res.headersSent) {
@@ -538,13 +641,11 @@ function createServer() {
     }
   });
 
-  // ----- server tuning: keep client sockets warm, allow many concurrent -----
-  server.keepAliveTimeout = 120_000;     // 2 min idle keep-alive
-  server.headersTimeout = 125_000;       // MUST be > keepAliveTimeout
-  server.requestTimeout = 30_000;        // 30s to receive request headers
-  server.timeout = 0;                    // no inactivity timeout (streaming)
-  server.maxConnections = 16_384;         // allow many simultaneous players
-  server.maxHeaderSize = 16 * 1024;
+  server.keepAliveTimeout = 120_000;
+  server.headersTimeout = 125_000; // must be > keepAliveTimeout
+  server.requestTimeout = 30_000;
+  server.timeout = 0;
+  server.maxConnections = 16_384;
 
   server.on("clientError", (err, socket) => {
     try {
@@ -565,8 +666,6 @@ function log(req, res, profile, mode, started) {
 /* ------------------------------------------------------------------ */
 
 function startWorker() {
-  // Never crash the process on async errors — log and continue.
-  // A crash = Coolify restart = 503 = "CORS error" for the player.
   process.on("unhandledRejection", (reason) =>
     console.error(`[vps-proxy-pool:${process.pid}] unhandledRejection:`, reason),
   );
@@ -576,7 +675,9 @@ function startWorker() {
 
   const server = createServer();
   server.listen(PORT, HOST, () => {
-    console.log(`[vps-proxy-pool:${process.pid}] listening on http://${HOST}:${PORT} (default: ${DEFAULT_PROFILE})`);
+    console.log(
+      `[vps-proxy-pool:${process.pid}] listening on http://${HOST}:${PORT} | default: ${DEFAULT_PROFILE} | transport: ${undici ? "undici+h2" : "node keep-alive"}`,
+    );
   });
 
   for (const sig of ["SIGINT", "SIGTERM"]) {
@@ -588,7 +689,7 @@ function startWorker() {
 }
 
 if (USE_CLUSTER && cluster.isPrimary) {
-  console.log(`[vps-proxy-pool] primary ${process.pid} spawning ${WORKERS} workers`);
+  console.log(`[vps-proxy-pool] primary ${process.pid} spawning ${WORKERS} workers (transport: ${undici ? "undici+h2" : "node keep-alive"})`);
   for (let i = 0; i < WORKERS; i++) cluster.fork();
   cluster.on("exit", (worker, code, signal) => {
     console.log(
@@ -596,9 +697,8 @@ if (USE_CLUSTER && cluster.isPrimary) {
     );
     cluster.fork();
   });
-  // worker stdout already flows through to primary's stdout in Node
 } else {
   startWorker();
 }
 
-module.exports = { createServer, PROFILES, encryptToken, decryptToken, TOKEN_RE, buildDispatcher };
+module.exports = { createServer, PROFILES, encryptToken, decryptToken, TOKEN_RE };
