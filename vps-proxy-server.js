@@ -369,17 +369,17 @@ function createServer() {
         const body = JSON.stringify(
           {
             ok: true,
-            service: "vps-proxy-pool",
-            node: process.version,
-            defaultProfile: DEFAULT_PROFILE,
-            outboundProxy: dispatcher ? "on" : "off",
-            profiles,
-            usage: [
-              "/{profile}/https://upstream.com/path   (plain mode)",
-              "/{profile}/v1.<iv>.<data>               (encrypted mode)",
-              `/https://upstream.com/path              (plain mode, default profile: ${DEFAULT_PROFILE})`,
-              `/v1.<iv>.<data>                         (encrypted mode, default profile: ${DEFAULT_PROFILE})`,
-            ],
+           // service: "vps-proxy-pool",
+          //  node: process.version,
+          //  defaultProfile: DEFAULT_PROFILE,
+          //  outboundProxy: dispatcher ? "on" : "off",
+         //   profiles,
+         //   usage: [
+         //     "/{profile}/https://upstream.com/path   (plain mode)",
+         //     "/{profile}/v1.<iv>.<data>               (encrypted mode)",
+         //     `/https://upstream.com/path              (plain mode, default profile: ${DEFAULT_PROFILE})`,
+        //      `/v1.<iv>.<data>                         (encrypted mode, default profile: ${DEFAULT_PROFILE})`,
+        //    ],
           },
           null,
           2,
