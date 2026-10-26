@@ -583,11 +583,11 @@ function createServer() {
         );
         const body = JSON.stringify(
           {
-            ok: true,
-            transport: undici ? "undici (h2 + pool)" : "node keep-alive agents",
-            workers: USE_CLUSTER ? WORKERS : 1,
-            defaultProfile: DEFAULT_PROFILE,
-            profiles,
+         //   ok: true,
+          //  transport: undici ? "undici (h2 + pool)" : "node keep-alive agents",
+          //  workers: USE_CLUSTER ? WORKERS : 1,
+         //   defaultProfile: DEFAULT_PROFILE,
+          //  profiles,
           },
           null,
           2,
