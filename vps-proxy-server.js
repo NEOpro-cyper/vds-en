@@ -294,7 +294,10 @@ async function proxyRequest(req, res, targetUrl, profile, encrypt, selfBase) {
     const lk = k.toLowerCase();
     // hop-by-hop + body-framing headers Node manages itself; content-length
     // is omitted because undici may have decompressed the body (length shift)
-    if (["content-encoding", "content-length", "transfer-encoding", "connection", "keep-alive"].includes(lk)) return;
+        if (["content-encoding", "content-length", "transfer-encoding", "connection", "keep-alive"].includes(lk)) return;
+    // NEVER copy upstream CORS headers — the browser would get two
+    // Access-Control-Allow-Origin values ("*, *") -> CORS error
+    if (lk.startsWith("access-control-")) return;
     outHeaders[k] = v;
   });
   outHeaders["X-Proxy-Mode"] = encrypt ? "encrypted" : "plain";
@@ -311,8 +314,12 @@ async function proxyRequest(req, res, targetUrl, profile, encrypt, selfBase) {
 /* ------------------------------------------------------------------ */
 
 function createServer() {
-  return http.createServer(async (req, res) => {
+  const server = http.createServer(async (req, res) => {
     const started = Date.now();
+    // video players abort segment requests constantly — a dead socket
+    // must NEVER take the process down (crash = Coolify restart = 503)
+    req.on("error", () => {});
+    res.on("error", () => {});
     try {
       // CORS preflight — same as the workers
       if (req.method === "OPTIONS") {
@@ -435,6 +442,14 @@ function log(req, res, profile, mode, started) {
 /* ------------------------------------------------------------------ */
 
 if (require.main === module) {
+  // log instead of dying (a crash = Coolify restart = 503 = "CORS error")
+  process.on("unhandledRejection", (reason) =>
+    console.error("[vps-proxy-pool] unhandledRejection:", reason),
+  );
+  process.on("uncaughtException", (err) =>
+    console.error("[vps-proxy-pool] uncaughtException:", err),
+  );
+
   const server = createServer();
   server.listen(PORT, HOST, () => {
     console.log(`[vps-proxy-pool] listening on http://${HOST}:${PORT}`);
